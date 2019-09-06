@@ -57,7 +57,9 @@ object ParadoxPlugin extends AutoPlugin {
     paradoxDefaultTemplateName := "page",
     paradoxLeadingBreadcrumbs := Nil,
     paradoxGroups := Map.empty,
-    libraryDependencies ++= paradoxTheme.value.toSeq map (_ % ParadoxTheme)
+    libraryDependencies ++= paradoxTheme.value.toSeq map (_ % ParadoxTheme),
+    paradoxValidationIgnorePaths := List("http://localhost"),
+    paradoxValidationSiteBaseUrl := None
   )
 
   def paradoxSettings(config: Configuration): Seq[Setting[_]] = paradoxGlobalSettings ++
@@ -154,7 +156,7 @@ object ParadoxPlugin extends AutoPlugin {
     }).value,
     mappings in paradoxTemplate := Defaults.relativeMappings(sources in paradoxTemplate, sourceDirectories in paradoxTemplate).value,
 
-    paradoxMarkdownToHtml := (Def.taskDyn {
+    paradoxMarkdownToHtml := Def.taskDyn {
       val strms = streams.value
       IO.delete((target in paradoxMarkdownToHtml).value)
       Def.task {
@@ -171,10 +173,16 @@ object ParadoxPlugin extends AutoPlugin {
           paradoxNavigationIncludeHeaders.value,
           paradoxRoots.value,
           paradoxTemplate.value,
-          s => strms.log.warn(s)
-        )
+          s => strms.log.warn(s),
+          s => strms.log.error(s)
+        ) match {
+            case Left(error) =>
+              strms.log.error(error)
+              throw new ParadoxException
+            case Right(files) => files
+          }
       }
-    }).value,
+    }.value,
 
     includeFilter in paradox := AllPassFilter,
     excludeFilter in paradox := {
@@ -196,8 +204,29 @@ object ParadoxPlugin extends AutoPlugin {
 
     paradoxBrowse := openInBrowser(paradox.value / "index.html", streams.value.log),
 
-    paradox := SbtWeb.syncMappings(WCompat.cacheStore(streams.value, "paradox"), (mappings in paradox).value, (target in paradox).value)
+    paradox := SbtWeb.syncMappings(WCompat.cacheStore(streams.value, "paradox"), (mappings in paradox).value, (target in paradox).value),
+
+    paradoxValidateInternalLinks := validateLinksTask(false).value,
+    paradoxValidateLinks := validateLinksTask(true).value
   )
+
+  private def validateLinksTask(validateAbsolute: Boolean) = Def.task {
+    val strms = streams.value
+    val errors = paradoxProcessor.value.validate(
+      (mappings in paradoxMarkdownToHtml).value,
+      (mappings in paradox).value,
+      paradoxGroups.value,
+      paradoxProperties.value,
+      paradoxValidationIgnorePaths.value,
+      validateAbsolute,
+      paradoxValidationSiteBaseUrl.value.map(_.toURI),
+      s => strms.log.error(s)
+    )
+    if (errors > 0) {
+      strms.log.error(s"Paradox validation found $errors errors")
+      throw new ParadoxException
+    }
+  }
 
   private def configTarget(config: Configuration) =
     if (config.name == Compile.name) "main"
@@ -259,5 +288,7 @@ object ParadoxPlugin extends AutoPlugin {
     if (Desktop.isDesktopSupported) Desktop.getDesktop.open(rootDocFile)
     else log.info(s"Couldn't open default browser, but docs are at $rootDocFile")
   }
+
+  class ParadoxException extends RuntimeException with FeedbackProvidedException
 
 }
