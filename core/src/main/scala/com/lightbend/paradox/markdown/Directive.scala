@@ -263,19 +263,20 @@ case class ExtRefDirective(ctx: Writer.Context)
 abstract class ApiDocDirective(name: String)
   extends ExternalLinkDirective(name, name + ":") {
 
-  def resolveApiLink(base: Url, link: String): Url
+  def resolveApiLink(base: Url, link: String, matchedPackage: String): Url
 
   val defaultBaseUrl = PropertyUrl(name + ".base_url", variables.get)
   val ApiDocProperty = raw"""$name\.(.*)\.base_url""".r
   val baseUrls = variables.collect {
-    case (property @ ApiDocProperty(pkg), url) => (pkg, PropertyUrl(property, variables.get))
+    case (property @ ApiDocProperty(pkg), url) => (pkg, (pkg, PropertyUrl(property, variables.get)))
   }
 
   def resolveLink(node: DirectiveNode, link: String): Url = {
     val levels = link.split("[.]")
     val packages = (1 to levels.init.size).map(levels.take(_).mkString("."))
-    val baseUrl = packages.reverse.collectFirst(baseUrls).getOrElse(defaultBaseUrl).resolve()
-    val resolvedLink = resolveApiLink(baseUrl, link)
+    val (pkg, propertyUrl) = packages.reverse.collectFirst(baseUrls).getOrElse(("", defaultBaseUrl))
+    val baseUrl = propertyUrl.resolve()
+    val resolvedLink = resolveApiLink(baseUrl, link, pkg)
     val resolvedPath = resolvedLink.base.getPath
     if (resolvedPath startsWith ".../") resolvedLink.copy(path = page.base + resolvedPath.drop(4)) else resolvedLink
   }
@@ -285,7 +286,7 @@ abstract class ApiDocDirective(name: String)
 case class ScaladocDirective(ctx: Writer.Context)
   extends ApiDocDirective("scaladoc") {
 
-  def resolveApiLink(baseUrl: Url, link: String): Url = {
+  def resolveApiLink(baseUrl: Url, link: String, matchedPackage: String): Url = {
     val url = Url(link).base
     val path = url.getPath.replace('.', '/') + ".html"
     (baseUrl / path) withFragment (url.getFragment)
@@ -297,24 +298,69 @@ object JavadocDirective {
   // If Java 9+ we default to linking directly to the file, since it doesn't support frames, otherwise we default
   // to linking to the frames version with the class in the query parameter. Also, the version of everything up to
   // and including 8 starts with 1., so that's an easy way to tell if it's 9+ or not.
-  val framesLinkStyle = sys.props.get("java.specification.version").exists(_.startsWith("1."))
+  val isJdk9Plus = !sys.props.get("java.specification.version").exists(_.startsWith("1."))
 }
 
 case class JavadocDirective(ctx: Writer.Context)
   extends ApiDocDirective("javadoc") {
 
-  val framesLinkStyle = variables.get("javadoc.link_style").fold(JavadocDirective.framesLinkStyle)(_ == "frames")
+  def jdk9JavadocStyle(style: String) = style match {
+    case "jdk9+"  => true
+    case "detect" => JavadocDirective.isJdk9Plus
+    case _        => false
+  }
+  val defaultFramesLinkStyle = variables.get("javadoc.link_style").fold(!JavadocDirective.isJdk9Plus)(_ == "frames")
+  val defaultIsJdk9JavadocStyle = variables.get("javadoc.javadoc_style").map(jdk9JavadocStyle)
+  val JavadocStyleProperty = raw"""javadoc\.(.*)\.javadoc_style""".r
+  val javadocJdk9Styles = variables.collect {
+    case (JavadocStyleProperty(pkg), javadocStyle) => (pkg, jdk9JavadocStyle(javadocStyle))
+  }
 
-  def resolveApiLink(baseUrl: Url, link: String): Url = {
+  def resolveApiLink(baseUrl: Url, link: String, matchedPackage: String): Url = {
     val url = Url(link).base
     val path = url.getPath.replace('.', '/') + ".html"
+    val maybeJdk9Style = javadocJdk9Styles.get(matchedPackage).orElse(defaultIsJdk9JavadocStyle)
+    val f = url.getFragment
+    val fragment = if (f != null) {
+      maybeJdk9Style match {
+        case Some(true) =>
+          if (f.contains("-")) convertToJdk9Fragment(f)
+          else f
+        case Some(false) =>
+          if (f.contains("(")) {
+            f.replaceAll("[(),]", "-")
+          } else f
+        case None => url.getFragment
+      }
+    } else null
+
+    // Force non frames style if jdk9 style is being used since it doesn't support frames
+    val framesLinkStyle = !maybeJdk9Style.getOrElse(false) && defaultFramesLinkStyle
+
     if (framesLinkStyle) {
-      baseUrl.withEndingSlash.withQuery(path).withFragment(url.getFragment)
+      baseUrl.withEndingSlash.withQuery(path).withFragment(fragment)
     } else {
-      (baseUrl / path) withFragment url.getFragment
+      (baseUrl / path) withFragment fragment
     }
   }
 
+  private def convertToJdk9Fragment(fragment: String) = {
+    // Need to replace the first '-' with '(', the last '-' with ')', and every '-' in between with ','
+    val sb = new StringBuilder(fragment.length)
+    var replacement = '('
+    for (i <- 0 until fragment.length) {
+      val c = fragment.charAt(i)
+      if (c == '-') {
+        if (i == fragment.length - 1) {
+          sb.append(')')
+        } else {
+          sb.append(replacement)
+          replacement = ','
+        }
+      } else sb.append(c)
+    }
+    sb.toString()
+  }
 }
 
 object GitHubResolver {
